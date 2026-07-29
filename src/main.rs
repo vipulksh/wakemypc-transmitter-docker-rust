@@ -148,6 +148,7 @@ async fn main() {
     // This allows you to read and write concurrently without borrowing errors.
     let (mut write_half, mut read_half) = ws_stream.split();
 
+    // Create a multi producter and single-consumer asynchronous channel
     let (tx, mut rx) = mpsc::channel::<Message>(32);
     let tx_clone = tx.clone();
 
