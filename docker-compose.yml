@@ -1,0 +1,24 @@
+services:
+  wakemypc-rust-transmitter-dev:
+    container_name: wakemypc-rust-transmitter-dev
+    image: rust:latest
+    working_dir: /app
+    build:
+      context: .
+      dockerfile: ./compose/local/Dockerfile
+    volumes:
+      - ./:/app
+      - cargo-registry:/usr/local/cargo/registry
+      - target-cache:/app/target
+    env_file:
+      .env
+    # Sample values
+    # environment:
+    #   - RUST_LOG=debug
+    #   - TRANSMITTER_ID=test-1
+    #   - AUTH_TOKEN=test-token
+    command: cargo run
+    network_mode: "host"
+volumes:
+  cargo-registry:
+  target-cache:

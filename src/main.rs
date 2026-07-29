@@ -1,0 +1,237 @@
+use std::env;
+use serde::Serialize;
+use tokio::sync::mpsc;
+use tokio_tungstenite::{
+    connect_async, 
+    tungstenite::protocol::Message,
+    tungstenite::client::IntoClientRequest
+};
+use futures_util::{
+    StreamExt, 
+    SinkExt
+};
+
+// Define the structure of the authentication message
+#[derive(Serialize)]
+struct AuthMessage {
+    r#type: &'static str,           // type is "auth" literal
+    token: String,                  // The authentication token
+    hardware_id: String,            // The unique hardware ID of the transmitter
+    firmware_version: &'static str, // The version of the firmware running on the transmitter
+    ip: String,                     // The IP address of the transmitter
+}
+
+enum PicoResponse {
+    AuthOk,
+    RequestHeartbeat,
+    Pong,
+    Unknown,
+}
+
+// impl HeartBeat for serde::Value {
+//     free_ram: u32,
+//     total_ram: u32,
+//     wifi_rssi: i32,
+//     uptime_seconds: u64,
+//     reconnect_count: u32,
+//     flash_free: u32,
+//     flash_total: u32,
+// }
+
+struct TransmitterProtocolHandler {
+    heartbeat_interval: u32,
+    transmitter_id: String,
+    pico_public_id: String,
+    send_channel: mpsc::Sender<Message>,
+
+}
+
+impl TransmitterProtocolHandler {
+    fn new(transmitter_id: String, pico_public_id: String, send_channel: &mpsc::Sender<Message>) -> Self {
+        Self {
+            heartbeat_interval: 15,
+            transmitter_id,
+            pico_public_id,
+            send_channel: send_channel.clone(),
+        }
+    }
+
+    fn get_sample_heartbeat(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "heartbeat",
+            "health": {
+                "free_ram": 1024,
+                "total_ram": 2048,
+                "wifi_rssi": -50,
+                "uptime_seconds": 3600,
+                "reconnect_count": 0,
+                "flash_free": 512,
+                "flash_total": 1024
+            }
+        })
+    }
+
+    async fn start_heartbeats(&self) {
+        let send_channel = self.send_channel.clone();
+        let heartbeat_interval = self.heartbeat_interval;
+        let heartbeat = self.get_sample_heartbeat();
+        tokio::spawn(async move {
+            println!("Heartbeat task started, sending every {} seconds.", &heartbeat_interval);
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(heartbeat_interval as u64)).await;
+                println!("Sending heartbeat...");
+                if let Err(e) = send_channel.send(heartbeat.to_string().into()).await {
+                    eprintln!("Failed to send heartbeat: {}", e);
+                    break;
+                }
+            }
+        });
+    }
+
+    async fn send_json(&self, message: serde_json::Value) {
+        if let Err(e) = self.send_channel.send(message.to_string().into()).await {
+            eprintln!("Failed to send message: {}", e);
+        }
+    }
+
+    async fn handle_message(&self, message: serde_json::Value) {
+        let command_type = &message["type"];
+        match command_type.as_str() {
+            Some("request_heartbeat") => {
+                self.send_heartbeat().await;
+            }
+            Some("pong") => {
+            }
+            _ => {
+                println!("Received unknown command type: {}", &command_type);
+            }
+        }
+    }
+
+    async fn send_heartbeat(&self) {
+        println!("Sending message for requested heartbeat");
+        self.send_json(self.get_sample_heartbeat()).await;
+    }
+
+}
+
+#[tokio::main]
+async fn main() {
+    let _auth_token = env::var("AUTH_TOKEN").expect("AUTH_TOKEN must be set");
+    let server_url = env::var("SERVER_URL").unwrap_or_else(|_| "wss://wakemypc.com".to_string());
+
+    let transmitter_id = env::var("TRANSMITTER_ID").expect("TRANSMITTER_ID must be set");
+    println!("Starting transmitter: {transmitter_id}");
+    
+    let device_url = { server_url.clone() + "/ws/pico/" + &transmitter_id + "/"};
+    println!("Connecting to server at URL: {device_url}");
+
+    let mut request = device_url.into_client_request().unwrap();
+    request.headers_mut().insert("User-Agent", "wakemypc-rust-transmitter/1.0".parse().unwrap());
+
+
+    // request.headers_mut().insert("Authorization", format!("Bearer {}", _auth_token).parse().unwrap());
+    // Create the authentication message
+    let auth_message = Message::Text(serde_json::to_string(&AuthMessage {
+        r#type: "auth",
+        token: _auth_token,
+        hardware_id: transmitter_id.clone(),
+        firmware_version: "1.0.0",
+        ip: "192.168.11.100".to_string(), // TODO: Replace with actual IP address retrieval logic
+    }).unwrap().into());
+
+
+    // Connect to WebSocket server
+    let (ws_stream, _response) = connect_async(request).await.expect("Failed to connect to WebSocket server");
+    println!("WebSocket connection established, ready to send/receive messages.");
+
+    // This allows you to read and write concurrently without borrowing errors.
+    let (mut write_half, mut read_half) = ws_stream.split();
+
+    let (tx, mut rx) = mpsc::channel::<Message>(32);
+    let tx_clone = tx.clone();
+
+    // Write task: drains the channel and forwards messages to the WebSocket
+    let write_task = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let Err(e) = write_half.send(msg).await {
+                eprintln!("Write error: {}", e);
+                break;
+            }
+        }
+    });
+    // Read task: handles incoming messages; routes pongs back through the channel
+    let read_task = tokio::spawn(async move {
+        //Initialize the handler as None, it will be set when we receive the first message with a public_id
+        let mut handler: Option<TransmitterProtocolHandler> = None;
+        while let Some(result) = read_half.next().await {
+            match result {
+                Ok(Message::Text(text)) => {
+                    match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(json_message) => {
+                            let public_id = json_message["public_id"]
+                                        .as_str()
+                                        .unwrap_or("unknown");
+                            handler = Some(TransmitterProtocolHandler::new(
+                                        transmitter_id.clone(),
+                                        public_id.to_string(),
+                                        &tx_clone
+                                    ));
+                            
+                            match json_message["type"].as_str() {
+                                Some("auth_ok") => {
+                                    println!("Authentication successful.");
+                                    handler.unwrap().start_heartbeats().await;
+                                }
+
+                                Some(message_type) => {
+                                    println!("Received message: {}", &json_message);
+                                    handler.unwrap().handle_message(json_message.clone()).await;
+                                }
+
+                                None => {
+                                    println!("Missing message type");
+                                }
+                            }
+                        }
+
+                        Err(e) => {
+                            eprintln!("Invalid JSON: {}", e);
+                        }
+                    }
+                }
+
+                Ok(Message::Ping(payload)) => {
+                    tx_clone
+                        .send(Message::Pong(payload))
+                        .await
+                        .unwrap();
+                }
+
+                Ok(Message::Close(_)) => {
+                    println!("Closed");
+                    break;
+                }
+
+                Err(e) => {
+                    eprintln!("Read error {}", e);
+                    break;
+                }
+
+                _ => {}
+            }
+        }
+    });
+
+    // Send the authentication message through the channel (write_half is owned by write_task)
+    if let Err(e) = tx.send(auth_message).await {
+        eprintln!("Error sending auth message: {}", e);
+        return;
+    }
+    println!("Authentication message sent.");
+    // test heartbeat message
+    tokio::select! {
+        _ = write_task => {}
+        _ = read_task => {}
+    }
+}
