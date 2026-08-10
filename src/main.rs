@@ -6,6 +6,8 @@ use tokio_tungstenite::{
     tungstenite::protocol::Message,
     tungstenite::client::IntoClientRequest
 };
+use serde::Deserialize;
+// use std::net::IPAddr;
 use futures_util::{
     StreamExt, 
     SinkExt
@@ -13,13 +15,20 @@ use futures_util::{
 use sysinfo::{System};
 use local_ip_address::{local_ip};
 
+#[derive(serde::Deserialize)]
+struct Device {
+    public_id: String,
+    name: String,
+    mac: String,
+    ip: String
+}
 
 struct TransmitterProtocolHandler {
     heartbeat_interval: u32,
     _transmitter_id: String,
     pico_id: String,
     send_channel: mpsc::Sender<Message>,
-    assigned_devices: serde_json::Value
+    assigned_devices: Vec<Device>
 }
 
 impl TransmitterProtocolHandler {
@@ -29,7 +38,7 @@ impl TransmitterProtocolHandler {
             _transmitter_id,
             pico_id: String::new(),
             send_channel: send_channel.clone(),
-            assigned_devices: json!([])
+            assigned_devices: vec![]
         }
     }
 
@@ -40,7 +49,21 @@ impl TransmitterProtocolHandler {
                 self.send_heartbeat().await;
             }
             Some("device_assignment") => {
-                self.assigned_devices = message["devices"].clone();
+                let _ = self.update_devices(message["devices"].clone());
+            }
+            Some("wol") => {
+                self.handle_wol(message["mac"].to_string()).await;
+            }
+            Some("ota_update") => {
+                self.send_json(json!({
+                    "type": "ota_result",
+                    "success": false,
+                    "message": "Docker Transmitters cannot be updated remotely!"
+                })).await
+            }
+            Some("firmware_update_available") => {
+                //Do nothing and just log to std
+                println!("Recieved Firmware update available.");
             }
             Some("pong") => {
                 // Do nothing since this a ack reply to our heartbeat message
@@ -49,6 +72,24 @@ impl TransmitterProtocolHandler {
                 println!("Received unknown command type: {}", &command_type);
             }
         }
+    }
+
+    async fn handle_wol(&self, to_wake_mac: String) -> Result<(), String> {
+        // let request_id: String = message["request_id"].to_string();
+
+        if !self.assigned_devices.iter().any(|device| device.mac == to_wake_mac) {
+            Err(String::from("Mac Address not assigned. Prevented Wake-on-lan Packet from being sent"))
+        }
+        else {
+            println!("Wake on lan packet sent");
+            Ok(())
+        }
+        
+    }
+
+    fn update_devices(&mut self, devices: serde_json::Value) -> Result<(), serde_json::Error>  {
+        self.assigned_devices = serde_json::from_value(devices)?;
+        Ok(())
     }
 
     async fn start_heartbeats(&self) {
@@ -116,7 +157,7 @@ async fn main() {
             "type": "auth",
             "token": _auth_token,
             "hardware_id": transmitter_id.clone(),
-            "firmware_version": "1.0.0",
+            "firmware_version": "0.1.0",
             "ip": local_ip().unwrap().to_string(), // TODO: Replace with actual IP address retrieval logic
         }).to_string().into()
     );
@@ -157,7 +198,7 @@ async fn main() {
                                 Some("auth_ok") => {
                                     println!("Authentication successful.");
                                     handler.pico_id = json_message["pico_id"].to_string();
-                                    handler.assigned_devices = json_message["assigned_devices"].clone();
+                                    let _ = handler.update_devices(json_message["assigned_devices"].clone()).unwrap();
                                     handler.start_heartbeats().await;
                                 }
 
