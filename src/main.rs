@@ -1,5 +1,6 @@
 use std::env;
 use serde::Serialize;
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
     connect_async, 
@@ -10,6 +11,7 @@ use futures_util::{
     StreamExt, 
     SinkExt
 };
+use sysinfo::{System, };
 
 // Define the structure of the authentication message
 #[derive(Serialize)]
@@ -21,12 +23,12 @@ struct AuthMessage {
     ip: String,                     // The IP address of the transmitter
 }
 
-enum PicoResponse {
-    AuthOk,
-    RequestHeartbeat,
-    Pong,
-    Unknown,
-}
+// enum PicoResponse {
+//     AuthOk,
+//     RequestHeartbeat,
+//     Pong,
+//     Unknown,
+// }
 
 // impl HeartBeat for serde::Value {
 //     free_ram: u32,
@@ -40,47 +42,50 @@ enum PicoResponse {
 
 struct TransmitterProtocolHandler {
     heartbeat_interval: u32,
-    transmitter_id: String,
-    pico_public_id: String,
+    _transmitter_id: String,
+    pico_id: String,
     send_channel: mpsc::Sender<Message>,
-
+    assigned_devices: serde_json::Value
 }
 
 impl TransmitterProtocolHandler {
-    fn new(transmitter_id: String, pico_public_id: String, send_channel: &mpsc::Sender<Message>) -> Self {
+    fn new(_transmitter_id: String, send_channel: &mpsc::Sender<Message>) -> Self {
         Self {
             heartbeat_interval: 15,
-            transmitter_id,
-            pico_public_id,
+            _transmitter_id,
+            pico_id: String::new(),
             send_channel: send_channel.clone(),
+            assigned_devices: json!([]),
         }
     }
 
-    fn get_sample_heartbeat(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "heartbeat",
-            "health": {
-                "free_ram": 1024,
-                "total_ram": 2048,
-                "wifi_rssi": -50,
-                "uptime_seconds": 3600,
-                "reconnect_count": 0,
-                "flash_free": 512,
-                "flash_total": 1024
+    async fn handle_message(&mut self, message: serde_json::Value) {
+        let command_type = &message["type"];
+        match command_type.as_str() {
+            Some("request_heartbeat") => {
+                self.send_heartbeat().await;
             }
-        })
+            Some("device_assignment") => {
+                self.assigned_devices = message["devices"].clone();
+            }
+            Some("pong") => {
+                // Do nothing since this a ack reply to our heartbeat message
+            }
+            _ => {
+                println!("Received unknown command type: {}", &command_type);
+            }
+        }
     }
 
     async fn start_heartbeats(&self) {
         let send_channel = self.send_channel.clone();
         let heartbeat_interval = self.heartbeat_interval;
-        let heartbeat = self.get_sample_heartbeat();
+        
         tokio::spawn(async move {
             println!("Heartbeat task started, sending every {} seconds.", &heartbeat_interval);
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(heartbeat_interval as u64)).await;
-                println!("Sending heartbeat...");
-                if let Err(e) = send_channel.send(heartbeat.to_string().into()).await {
+                if let Err(e) = send_channel.send(Self::get_sample_heartbeat().to_string().into()).await {
                     eprintln!("Failed to send heartbeat: {}", e);
                     break;
                 }
@@ -94,26 +99,29 @@ impl TransmitterProtocolHandler {
         }
     }
 
-    async fn handle_message(&self, message: serde_json::Value) {
-        let command_type = &message["type"];
-        match command_type.as_str() {
-            Some("request_heartbeat") => {
-                self.send_heartbeat().await;
+    fn get_sample_heartbeat() -> serde_json::Value {
+        let sys = System::new_all();
+        json!({
+            "type": "heartbeat",
+            "health": {
+                "free_ram": sys.total_memory() - sys.used_memory(),
+                "total_ram": sys.total_memory(),
+                "wifi_rssi": -50,
+                "uptime_seconds": 0,
+                "reconnect_count": 0,
+                "flash_free": 512,
+                "flash_total": 1024
             }
-            Some("pong") => {
-            }
-            _ => {
-                println!("Received unknown command type: {}", &command_type);
-            }
-        }
+        })
     }
 
     async fn send_heartbeat(&self) {
         println!("Sending message for requested heartbeat");
-        self.send_json(self.get_sample_heartbeat()).await;
+        self.send_json(Self::get_sample_heartbeat()).await;
     }
 
 }
+
 
 #[tokio::main]
 async fn main() {
@@ -127,7 +135,7 @@ async fn main() {
     println!("Connecting to server at URL: {device_url}");
 
     let mut request = device_url.into_client_request().unwrap();
-    request.headers_mut().insert("User-Agent", "wakemypc-rust-transmitter/1.0".parse().unwrap());
+    request.headers_mut().insert("User-Agent", "wakemypc-rust-transmitter/0.1.0".parse().unwrap());
 
 
     // request.headers_mut().insert("Authorization", format!("Bearer {}", _auth_token).parse().unwrap());
@@ -164,30 +172,28 @@ async fn main() {
     // Read task: handles incoming messages; routes pongs back through the channel
     let read_task = tokio::spawn(async move {
         //Initialize the handler as None, it will be set when we receive the first message with a public_id
-        let mut handler: Option<TransmitterProtocolHandler> = None;
+        let mut handler = TransmitterProtocolHandler::new(
+                                        transmitter_id.clone(),
+                                        &tx_clone
+        );
         while let Some(result) = read_half.next().await {
             match result {
                 Ok(Message::Text(text)) => {
                     match serde_json::from_str::<serde_json::Value>(&text) {
                         Ok(json_message) => {
-                            let public_id = json_message["public_id"]
-                                        .as_str()
-                                        .unwrap_or("unknown");
-                            handler = Some(TransmitterProtocolHandler::new(
-                                        transmitter_id.clone(),
-                                        public_id.to_string(),
-                                        &tx_clone
-                                    ));
-                            
                             match json_message["type"].as_str() {
                                 Some("auth_ok") => {
                                     println!("Authentication successful.");
-                                    handler.unwrap().start_heartbeats().await;
+                                    handler.pico_id = json_message["pico_id"].to_string();
+                                    handler.assigned_devices = json_message["assigned_devices"].clone();
+
+
+                                    handler.start_heartbeats().await;
                                 }
 
-                                Some(message_type) => {
+                                Some(_) => {
                                     println!("Received message: {}", &json_message);
-                                    handler.unwrap().handle_message(json_message.clone()).await;
+                                    handler.handle_message(json_message).await;
                                 }
 
                                 None => {
