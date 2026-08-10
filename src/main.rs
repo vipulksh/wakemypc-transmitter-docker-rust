@@ -1,5 +1,4 @@
 use std::env;
-use serde::Serialize;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
@@ -11,34 +10,9 @@ use futures_util::{
     StreamExt, 
     SinkExt
 };
-use sysinfo::{System, };
+use sysinfo::{System};
+use local_ip_address::{local_ip};
 
-// Define the structure of the authentication message
-#[derive(Serialize)]
-struct AuthMessage {
-    r#type: &'static str,           // type is "auth" literal
-    token: String,                  // The authentication token
-    hardware_id: String,            // The unique hardware ID of the transmitter
-    firmware_version: &'static str, // The version of the firmware running on the transmitter
-    ip: String,                     // The IP address of the transmitter
-}
-
-// enum PicoResponse {
-//     AuthOk,
-//     RequestHeartbeat,
-//     Pong,
-//     Unknown,
-// }
-
-// impl HeartBeat for serde::Value {
-//     free_ram: u32,
-//     total_ram: u32,
-//     wifi_rssi: i32,
-//     uptime_seconds: u64,
-//     reconnect_count: u32,
-//     flash_free: u32,
-//     flash_total: u32,
-// }
 
 struct TransmitterProtocolHandler {
     heartbeat_interval: u32,
@@ -55,7 +29,7 @@ impl TransmitterProtocolHandler {
             _transmitter_id,
             pico_id: String::new(),
             send_channel: send_channel.clone(),
-            assigned_devices: json!([]),
+            assigned_devices: json!([])
         }
     }
 
@@ -137,17 +111,15 @@ async fn main() {
     let mut request = device_url.into_client_request().unwrap();
     request.headers_mut().insert("User-Agent", "wakemypc-rust-transmitter/0.1.0".parse().unwrap());
 
-
-    // request.headers_mut().insert("Authorization", format!("Bearer {}", _auth_token).parse().unwrap());
     // Create the authentication message
-    let auth_message = Message::Text(serde_json::to_string(&AuthMessage {
-        r#type: "auth",
-        token: _auth_token,
-        hardware_id: transmitter_id.clone(),
-        firmware_version: "1.0.0",
-        ip: "192.168.11.100".to_string(), // TODO: Replace with actual IP address retrieval logic
-    }).unwrap().into());
-
+    let auth_message = Message::Text(json!({
+            "type": "auth",
+            "token": _auth_token,
+            "hardware_id": transmitter_id.clone(),
+            "firmware_version": "1.0.0",
+            "ip": local_ip().unwrap().to_string(), // TODO: Replace with actual IP address retrieval logic
+        }).to_string().into()
+    );
 
     // Connect to WebSocket server
     let (ws_stream, _response) = connect_async(request).await.expect("Failed to connect to WebSocket server");
@@ -186,9 +158,11 @@ async fn main() {
                                     println!("Authentication successful.");
                                     handler.pico_id = json_message["pico_id"].to_string();
                                     handler.assigned_devices = json_message["assigned_devices"].clone();
-
-
                                     handler.start_heartbeats().await;
+                                }
+
+                                Some("auth_fail") => {
+                                    println!("Authentication failed! Reason: {}", &json_message["reason"])
                                 }
 
                                 Some(_) => {
@@ -216,7 +190,7 @@ async fn main() {
                 }
 
                 Ok(Message::Close(_)) => {
-                    println!("Closed");
+                    println!("Websocket Connection Closed.");
                     break;
                 }
 
