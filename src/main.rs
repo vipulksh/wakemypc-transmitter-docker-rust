@@ -55,6 +55,15 @@ impl TransmitterProtocolHandler {
                 "wol" => {
                     let _ = self.handle_wol(message["mac"].to_string()).await;
                 }
+                "tcp_relay_open" => {
+
+                }
+                "tcp_relay_data" => {
+
+                }
+                "tcp_relay_close" => {
+
+                }
                 "ota_update" => {
                     self.send_json(json!({
                         "type": "ota_result",
@@ -67,14 +76,14 @@ impl TransmitterProtocolHandler {
                         "type": "wifi.config",
                         "pico_id": self.pico_id,
                         "networks": [],
-                        "message": "This transmitter doesn't work thorugh WiFi."
+                        "message": "Docker transmitters doesn't work on WiFi."
                         })
                     ).await
                 }
                 "wifi_config_set" => {
                     self.send_json(json!({
                         "type": "error",
-                        "message": "This transmitter doesn't work on WiFi.",
+                        "message": "Docker transmitters doesn't work on WiFi.",
                         })
                     ).await
                 }
@@ -193,7 +202,7 @@ async fn main() {
             "type": "auth",
             "token": auth_token,
             "hardware_id": transmitter_id.clone(),
-            "firmware_version": "0.1.0",
+            "firmware_version": "0.1.0-docker",
             "ip": local_ip_address::local_ip().unwrap().to_string(),
         }).to_string().into()
     );
