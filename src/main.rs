@@ -3,7 +3,6 @@ static MAX_RETRY_LIMIT_SECS: u64 = 60;
 use std::env;
 use std::time::{
     Instant,
-    Duration
 };
 use serde_json::json;
 use tokio::{
@@ -221,37 +220,31 @@ impl TransmitterProtocolHandler {
         let (ws_stream, _response) = connect_async(request.clone()).await?;
         Ok(ws_stream)
     }
+
     fn get_authentication_message(&self) -> Message {
         // Create the authentication message
         let auth_message: AuthMessage = AuthMessage { 
                 r#type: "auth",
                 token: &self.auth_token,
                 hardware_id: &self.transmitter_id,
-                firmware_version: "0.1.0-docker",
+                firmware_version: FIRMWARE_VERSION,
                 ip: &local_ip_address::local_ip().unwrap().to_string()
         };
         Message::Text(serde_json::to_string(&auth_message).unwrap().into())
-
     }
-    async fn start(&mut self) -> Result<(), Error> {
+
+    async fn start(&mut self){
         let mut retry_time: u64 = 1;
         loop {
             // Retry until auth is succesful
             match self.open_websocket().await {
                 Ok(ws_stream) => {
                     let (mut write_half, mut read_half) = ws_stream.split();
-                    // if let Err(e) = write_half.send(self.get_authentication_message()).await{
-                    //     retry_time = std::cmp::min(retry_time*2, MAX_RETRY_LIMIT_SECS);
-                    //     print!("Error Occured: {}", e);
-                    //     println!("Authentication Failed! Retrying in {}s.", retry_time);
-                    //     write_half.close().await;
-                    //     tokio::time::sleep(Duration::from_secs(retry_time));
-                    //     continue;
-                    // } //Auth Message sent successful
 
                     // Create a multi producter and single-consumer asynchronous channel
                     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Message>(32);
                     let (incoming_tx, mut incoming_rx) = mpsc::channel::<serde_json::Value>(32);
+                    
                     let outgoing_tx_clone = outgoing_tx.clone();
 
                     // Write task: drains the channel and forwards messages to the WebSocket
@@ -259,7 +252,7 @@ impl TransmitterProtocolHandler {
                         while let Some(msg) = outgoing_rx.recv().await {
                             if let Err(e) = write_half.send(msg).await {
                                 eprintln!("Write error: {}", e);
-                                // return Err(e);
+                                break;
                             }
                         }
                     });
@@ -320,12 +313,11 @@ impl TransmitterProtocolHandler {
                             _ = &mut write_task => {
                                 break;
                             }
-
                         }
-                    }    
-                }   
+                    }
+                }
                 Err(e) => {
-                    print!("Error while opening websocket: {}", e)
+                    println!("Error while opening websocket: {}", e)
                 }
             } 
 
@@ -354,26 +346,4 @@ async fn main() {
     println!("Starting transmitter: {transmitter_id}");
     let mut handler = TransmitterProtocolHandler::new(auth_token);
     handler.start().await;
-    
-
-
-    // // Connect to WebSocket server
-    // let (ws_stream, _response) = connect_async(request).await.expect("Failed to connect to WebSocket server");
-    // println!("WebSocket connection established, ready to send/receive messages.");
-
-    // // This allows you to read and write concurrently without borrowing errors.
-    // let (mut write_half, mut read_half) = ws_stream.split();
-
-    // // Send the authentication message through the channel (write_half is owned by write_task)
-    // if let Err(e) = tx.send(auth_message).await {
-    //     eprintln!("Error sending auth message: {}", e);
-    //     // return Err(e);
-    // }
-    // println!("Authentication message sent.");
-    // // test heartbeat message
-    // tokio::select! {
-    //     _ = write_task => {}
-    //     _ = read_task => {}
-    // }
-    // return Ok(());
 }
