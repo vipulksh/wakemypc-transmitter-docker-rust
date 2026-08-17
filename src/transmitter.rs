@@ -80,7 +80,9 @@ impl TransmitterProtocolHandler {
                     send_json(hearbeat).await;
                 }
                 "device_assignment" => {
-                    let _ = self.update_devices(message["devices"].clone());
+                    if let Err(e) = self.update_devices(message["devices"].clone()){
+                        println!("Update devices failed, incorrect json, Error: {}", e)
+                    };
                 }
                 "wol" => {
                     let _ = self.handle_wol(message["mac"].to_string()).await;
