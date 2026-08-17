@@ -5,7 +5,6 @@ edition = "2021"
 
 [[bin]]
 name = "transmitter"
-path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync", "time"] }
