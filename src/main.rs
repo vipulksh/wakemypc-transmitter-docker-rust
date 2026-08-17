@@ -45,6 +45,7 @@ struct AuthMessage<'a> {
 struct TransmitterProtocolHandler {
     time_started: std::time::Instant,
     auth_token: String,
+    reconnect_count: u8,
     heartbeat_interval: u16,
     transmitter_id: String,
     pico_id: String,
@@ -52,18 +53,19 @@ struct TransmitterProtocolHandler {
 }
 
 impl TransmitterProtocolHandler {
-    fn new(auth_token: String) -> Self {
+    fn new(transmitter_id: String, auth_token: String) -> Self {
         Self {
             time_started: std::time::Instant::now(),
             auth_token,
+            reconnect_count: 0,
             heartbeat_interval: 15,
-            transmitter_id: String::new(),
+            transmitter_id,
             pico_id: String::new(),
             assigned_devices: vec![]
         }
     }
 
-    async fn handle_message(&mut self, message: serde_json::Value, send_channel: mpsc::Sender::<Message>) {
+    async fn handle_message(&mut self, message: serde_json::Value, send_channel: &mpsc::Sender::<Message>) {
         let send_json = async |value: serde_json::Value| {
             if let Err(e) = &send_channel.send(value.to_string().into()).await {
                 eprintln!("Failed to send message: {}", e);
@@ -235,6 +237,22 @@ impl TransmitterProtocolHandler {
 
     async fn start(&mut self){
         let mut retry_time: u64 = 1;
+        let mut wait_and_backoff = async |reset| {
+            if reset {
+                retry_time = 1;
+                return;
+            };
+            println!("Waiting {} secs...", retry_time);
+            tokio::time::sleep(tokio::time::Duration::from_secs(retry_time)).await;
+            retry_time *= 2;
+            retry_time = {
+                if retry_time > MAX_RETRY_LIMIT_SECS{
+                    MAX_RETRY_LIMIT_SECS
+                } else {
+                    retry_time
+                }
+            }
+        };
         loop {
             // Retry until auth is succesful
             match self.open_websocket().await {
@@ -298,13 +316,18 @@ impl TransmitterProtocolHandler {
                             }
                         }
                     });
-                    self.send_channel = Some(outgoing_tx.clone());
                     // begin receiving and sending messages,
+                    if let Err(e) = outgoing_tx.send(self.get_authentication_message()).await {
+                        println!("{}", e);
+                        wait_and_backoff(false).await;
+                        continue;
+                    }
+                    wait_and_backoff(true).await;
                     loop {
                         tokio::select! {
                             Some(json_message) = incoming_rx.recv() => {
-                                self.handle_message(json_message).await;
-                            } ,
+                                self.handle_message(json_message, &outgoing_tx).await;
+                            },
                             // break exists so that when either of them returns(something happened such that they returned) 
                             // we can reconnect to the websocket.
                             _ = &mut read_task => {
@@ -320,19 +343,9 @@ impl TransmitterProtocolHandler {
                     println!("Error while opening websocket: {}", e)
                 }
             } 
-
+            // Need to add stop hearbeats here for clean stop of all 
             // if the websocket closes begin the auth process again,
-            
-            tokio::time::sleep(tokio::time::Duration::from_secs(retry_time));
-            retry_time *= 2;
-            retry_time = {
-                if retry_time > MAX_RETRY_LIMIT_SECS{
-                    MAX_RETRY_LIMIT_SECS
-                } else {
-                    retry_time
-                }
-            }
-
+            wait_and_backoff(false).await;
         }
     }
 
@@ -344,6 +357,6 @@ async fn main() {
     let auth_token = env::var("AUTH_TOKEN").expect("AUTH_TOKEN must be set");
     let transmitter_id = env::var("TRANSMITTER_ID").expect("TRANSMITTER_ID must be set");
     println!("Starting transmitter: {transmitter_id}");
-    let mut handler = TransmitterProtocolHandler::new(auth_token);
+    let mut handler = TransmitterProtocolHandler::new(transmitter_id, auth_token);
     handler.start().await;
 }
