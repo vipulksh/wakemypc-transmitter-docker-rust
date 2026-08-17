@@ -5,21 +5,20 @@ use std::time::{
     Instant,
     Duration
 };
-use serde::Serialize;
 use serde_json::json;
 use tokio::{
     sync::mpsc,
     net::TcpStream,
 };
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame;
 use tokio_tungstenite::{
     connect_async, 
     WebSocketStream,
     MaybeTlsStream,
     tungstenite::protocol::Message,
     tungstenite::client::IntoClientRequest,
-    tungstenite::http, 
     tungstenite::Error,
+    tungstenite::protocol::CloseFrame
 };
 // use std::net::IPAddr;
 use futures_util::{
@@ -116,6 +115,13 @@ impl TransmitterProtocolHandler {
                         "message": "Docker transmitters doesn't work on WiFi.",
                         })
                     ).await
+                }
+                "reboot" => {
+                    //Restart by closing the websocket connection, everything else automatically starts again.
+                    _ = send_channel.send(Message::Close(Some(CloseFrame {
+                        code: frame::coding::CloseCode::Restart,
+                        reason: "Restarting".into(),
+                    }))).await;
                 }
                 "firmware_update_available" => {
                     //Do nothing and just log to std
