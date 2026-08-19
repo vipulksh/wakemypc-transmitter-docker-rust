@@ -49,7 +49,8 @@ pub struct TransmitterProtocolHandler {
     heartbeat_interval: u16,
     transmitter_id: String,
     pico_id: String,
-    assigned_devices: Vec<Device>
+    assigned_devices: Vec<Device>,
+    heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl TransmitterProtocolHandler {
@@ -61,7 +62,8 @@ impl TransmitterProtocolHandler {
             heartbeat_interval: 15,
             transmitter_id,
             pico_id: String::new(),
-            assigned_devices: vec![]
+            assigned_devices: vec![],
+            heartbeat_handle: None,
         }
     }
 
@@ -119,13 +121,6 @@ impl TransmitterProtocolHandler {
                         })
                     ).await
                 }
-                "reboot" => {
-                    //Restart by closing the websocket connection, everything else automatically starts again.
-                    _ = send_channel.send(Message::Close(Some(CloseFrame {
-                        code: frame::coding::CloseCode::Restart,
-                        reason: "Restarting".into(),
-                    }))).await;
-                }
                 "firmware_update_available" => {
                     //Do nothing and just log to std
                     println!("Doing nothing for firmware_update_available.");
@@ -134,7 +129,7 @@ impl TransmitterProtocolHandler {
                     println!("Authentication successful.");
                     self.pico_id = message["pico_id"].to_string();
                     self.assigned_devices = serde_json::from_value(message["assigned_devices"].clone()).unwrap_or(vec![]);
-                    self.start_heartbeats(&send_channel).await;
+                    self.heartbeat_handle = Some(self.start_heartbeats(&send_channel).await);
                 }
 
                 "auth_fail" => {
@@ -175,7 +170,7 @@ impl TransmitterProtocolHandler {
         Ok(())
     }
 
-    async fn start_heartbeats(&self, send_channel: &mpsc::Sender<Message>) {
+    async fn start_heartbeats(&self, send_channel: &mpsc::Sender<Message>) -> tokio::task::JoinHandle<()> {
         let send_channel: mpsc::Sender<Message> = send_channel.clone();
         let heartbeat_interval: u16 = self.heartbeat_interval;
         let start_time: std::time::Instant = self.time_started.clone();
@@ -188,7 +183,7 @@ impl TransmitterProtocolHandler {
                     break;
                 }
             }
-        });
+        })
     }
 
     fn get_sample_heartbeat(started_at: &Instant) -> serde_json::Value {
@@ -237,7 +232,7 @@ impl TransmitterProtocolHandler {
         Message::Text(serde_json::to_string(&auth_message).unwrap().into())
     }
 
-    pub async fn start(&mut self){
+    pub async fn start(&mut self) {
         let mut retry_time: u64 = 1;
         let mut wait_and_backoff = async |reset| {
             if reset {
@@ -328,17 +323,41 @@ impl TransmitterProtocolHandler {
                     loop {
                         tokio::select! {
                             Some(json_message) = incoming_rx.recv() => {
-                                self.handle_message(json_message, &outgoing_tx).await;
+                                match json_message["type"].as_str() {
+                                    // if the server sends a reboot command, we abort the read and write tasks and break out of the loop to reconnect.
+                                    Some("reboot") => {
+                                        println!("Rebooting transmitter as requested by server.");
+                                        // send a close frame to the server for closing the connection
+                                        _ = outgoing_tx.send(Message::Close(Some(CloseFrame {
+                                            code: frame::coding::CloseCode::Normal,
+                                            reason: "Rebooting".into(),
+                                        }))).await;
+                                        read_task.abort();
+                                        write_task.abort();
+                                        break;
+                                    }
+                                    _ => {
+                                        self.handle_message(json_message, &outgoing_tx).await;
+                                    }
+                                }
                             },
                             // break exists so that when either of them returns(something happened such that they returned) 
                             // we can reconnect to the websocket.
                             _ = &mut read_task => {
+                                // If the read task ends, we abort the write task and break to reconnect
+                                write_task.abort();
                                 break;
                             },
                             _ = &mut write_task => {
+                                // If the write task ends, we abort the read task and break to reconnect
+                                read_task.abort();
                                 break;
                             }
                         }
+                    }
+                    // If we reach here, it means either the read or write task has ended, so we abort the heartbeat task if it exists.
+                    if let Some(handle) = &self.heartbeat_handle.take(){
+                        handle.abort();
                     }
                 }
                 Err(e) => {
@@ -349,6 +368,7 @@ impl TransmitterProtocolHandler {
             // if the websocket closes begin the auth process again,
             wait_and_backoff(false).await;
         }
+
     }
 
 }
