@@ -45,7 +45,7 @@ struct AuthMessage<'a> {
 pub struct TransmitterProtocolHandler {
     time_started: std::time::Instant,
     auth_token: String,
-    reconnect_count: u8,
+    reconnect_count: u32,
     heartbeat_interval: u16,
     transmitter_id: String,
     pico_id: String,
@@ -78,7 +78,7 @@ impl TransmitterProtocolHandler {
             match command_type {
                 "request_heartbeat" => {
                     println!("Sending message for requested heartbeat");    
-                    let hearbeat: serde_json::Value = Self::get_sample_heartbeat(&self.time_started);
+                    let hearbeat: serde_json::Value = Self::get_sample_heartbeat(&self.time_started, self.reconnect_count);
                     send_json(hearbeat).await;
                 }
                 "device_assignment" => {
@@ -174,11 +174,13 @@ impl TransmitterProtocolHandler {
         let send_channel: mpsc::Sender<Message> = send_channel.clone();
         let heartbeat_interval: u16 = self.heartbeat_interval;
         let start_time: std::time::Instant = self.time_started.clone();
+        let reconnect_count: u32 = self.reconnect_count;
         tokio::spawn(async move {
             println!("Heartbeat task started, sending every {} seconds.", &heartbeat_interval);
             loop {
+                // TODO: Need to handle SIGTERM cleanly here too.
                 tokio::time::sleep(tokio::time::Duration::from_secs(heartbeat_interval as u64)).await;
-                if let Err(e) = send_channel.send(Self::get_sample_heartbeat(&start_time).to_string().into()).await {
+                if let Err(e) = send_channel.send(Self::get_sample_heartbeat(&start_time, reconnect_count).to_string().into()).await {
                     eprintln!("Failed to send heartbeat: {}", e);
                     break;
                 }
@@ -186,7 +188,7 @@ impl TransmitterProtocolHandler {
         })
     }
 
-    fn get_sample_heartbeat(started_at: &Instant) -> serde_json::Value {
+    fn get_sample_heartbeat(started_at: &Instant, reconnect_count: u32) -> serde_json::Value {
         let sys: System = System::new_all();
         let now: Instant = Instant::now();
         json!({
@@ -196,7 +198,7 @@ impl TransmitterProtocolHandler {
                 "total_ram": sys.total_memory(),
                 "wifi_rssi": -50,
                 "uptime_seconds": now.duration_since(*started_at).as_secs(),
-                "reconnect_count": 0,
+                "reconnect_count": reconnect_count,
                 "flash_free": 512,
                 "flash_total": 1024
             }
@@ -234,21 +236,10 @@ impl TransmitterProtocolHandler {
 
     pub async fn start(&mut self) {
         let mut retry_time: u64 = 1;
-        let mut wait_and_backoff = async |reset| {
-            if reset {
-                retry_time = 1;
-                return;
-            };
-            println!("Waiting {} secs...", retry_time);
-            tokio::time::sleep(tokio::time::Duration::from_secs(retry_time)).await;
-            retry_time *= 2;
-            retry_time = {
-                if retry_time > MAX_RETRY_LIMIT_SECS{
-                    MAX_RETRY_LIMIT_SECS
-                } else {
-                    retry_time
-                }
-            }
+        let backoff_wait = async |waittime| -> u64 {
+            println!("Waiting {} secs...", waittime);
+            tokio::time::sleep(tokio::time::Duration::from_secs(waittime)).await;
+            return std::cmp::min(waittime*2, MAX_RETRY_LIMIT_SECS);
         };
         let mut stop_now: bool = false;
         // if sigterm is received, we break out of the loop and exit the program.
@@ -266,7 +257,6 @@ impl TransmitterProtocolHandler {
                     let (incoming_tx, mut incoming_rx) = mpsc::channel::<serde_json::Value>(32);
                     
                     let outgoing_tx_clone = outgoing_tx.clone();
-
                     // Write task: drains the channel and forwards messages to the WebSocket
                     let mut write_task = tokio::spawn(async move {
                         while let Some(msg) = outgoing_rx.recv().await {
@@ -318,13 +308,16 @@ impl TransmitterProtocolHandler {
                             }
                         }
                     });
-                    // begin receiving and sending messages,
+                    // Send the authentication message to the server. If it fails, we wait for a backoff time and retry.
                     if let Err(e) = outgoing_tx.send(self.get_authentication_message()).await {
                         println!("{}", e);
-                        wait_and_backoff(false).await;
+                        let temp = retry_time;
+                        retry_time = backoff_wait(temp).await;
                         continue;
                     }
-                    wait_and_backoff(true).await;
+                    // reset retry time when we successfully connect to the websocket, 
+                    // so that if it closes, we can begin the auth process again with a retry time of 1 second.
+                    retry_time = 1;
                     loop {
                         tokio::select! {
                             //sigterm is received, we break out of the loop and exit the program.
@@ -352,6 +345,7 @@ impl TransmitterProtocolHandler {
                                         }))).await;
                                         read_task.abort();
                                         write_task.abort();
+                                        self.reconnect_count = 0;
                                         break;
                                     }
                                     _ => {
@@ -377,9 +371,10 @@ impl TransmitterProtocolHandler {
                     if let Some(handle) = &self.heartbeat_handle.take(){
                         handle.abort();
                     }
+                    self.reconnect_count += 1;
                 }
                 Err(e) => {
-                    println!("Error while opening websocket: {}", e)
+                    println!("Error while opening websocket: {}", e);
                 }
             } 
             //if we receive a sigterm, we break out of the loop and exit the program.
@@ -388,7 +383,9 @@ impl TransmitterProtocolHandler {
                 break;
             }
             // if the websocket closes begin the auth process again,
-            wait_and_backoff(false).await;
+            let temp = retry_time;
+            retry_time = backoff_wait(temp).await;
+            println!("Retrying connection to server, reconnect count #{}", self.reconnect_count);
         }
 
     }
