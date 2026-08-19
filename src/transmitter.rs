@@ -250,6 +250,11 @@ impl TransmitterProtocolHandler {
                 }
             }
         };
+        let mut stop_now: bool = false;
+        // if sigterm is received, we break out of the loop and exit the program.
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate()
+            ).unwrap();
         loop {
             // Retry until auth is succesful
             match self.open_websocket().await {
@@ -322,6 +327,19 @@ impl TransmitterProtocolHandler {
                     wait_and_backoff(true).await;
                     loop {
                         tokio::select! {
+                            //sigterm is received, we break out of the loop and exit the program.
+                            _ = sigterm.recv() => {
+                                // println!("SIGTERM received, shutting down.");
+                                // send a close frame to the server for closing the connection
+                                _ = outgoing_tx.send(Message::Close(Some(CloseFrame {
+                                    code: frame::coding::CloseCode::Normal,
+                                    reason: "Shutting down.".into(),
+                                }))).await;
+                                write_task.abort();
+                                read_task.abort();
+                                stop_now = true;
+                                break;
+                            }
                             Some(json_message) = incoming_rx.recv() => {
                                 match json_message["type"].as_str() {
                                     // if the server sends a reboot command, we abort the read and write tasks and break out of the loop to reconnect.
@@ -364,7 +382,11 @@ impl TransmitterProtocolHandler {
                     println!("Error while opening websocket: {}", e)
                 }
             } 
-            // Need to add stop hearbeats here for clean stop of all 
+            //if we receive a sigterm, we break out of the loop and exit the program.
+            if stop_now {
+                println!("Received Shutdown signal, exiting.");
+                break;
+            }
             // if the websocket closes begin the auth process again,
             wait_and_backoff(false).await;
         }

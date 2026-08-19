@@ -7,7 +7,7 @@ edition = "2021"
 name = "transmitter"
 
 [dependencies]
-tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync", "time", "signal"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] } # Pure rust
 futures-util = "0.3"
