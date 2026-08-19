@@ -405,7 +405,7 @@ impl TransmitterProtocolHandler {
                     }
                     // If we reach here, it means either the read or write task has ended, so we abort the heartbeat task if it exists.
                     self.cancellation_token.cancel();
-                    // There is a off by one bug here when transmitter is rebooting
+                    // TODO: There is a off by one bug here when transmitter is rebooting
                     self.reconnect_count += 1;
                 }
                 Err(e) => {
