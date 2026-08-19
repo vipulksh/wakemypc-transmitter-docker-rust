@@ -18,6 +18,7 @@ use tokio_tungstenite::{
     tungstenite::Error,
     tungstenite::protocol::CloseFrame
 };
+use tokio_util::sync::CancellationToken;
 // use std::net::IPAddr;
 use futures_util::{
     StreamExt, 
@@ -50,7 +51,8 @@ pub struct TransmitterProtocolHandler {
     transmitter_id: String,
     pico_id: String,
     assigned_devices: Vec<Device>,
-    heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
+    send_channel: Option<mpsc::Sender<Message>>,
+    cancellation_token: CancellationToken,
 }
 
 impl TransmitterProtocolHandler {
@@ -63,27 +65,48 @@ impl TransmitterProtocolHandler {
             transmitter_id,
             pico_id: String::new(),
             assigned_devices: vec![],
-            heartbeat_handle: None,
+            send_channel: None,
+            cancellation_token: CancellationToken::new(),
+        }
+    }
+    async fn send_json(&self, value: serde_json::Value) {
+        if let Some(send_channel) = &self.send_channel {
+            if let Err(e) = send_channel.send(value.to_string().into()).await {
+                eprintln!("Failed to send message: {}", e);
+            }
+        } else {
+            eprintln!("Send channel not set for transmitter protocol handler.");
         }
     }
 
-    async fn handle_message(&mut self, message: serde_json::Value, send_channel: &mpsc::Sender::<Message>) {
-        let send_json = async |value: serde_json::Value| {
-            if let Err(e) = &send_channel.send(value.to_string().into()).await {
-                eprintln!("Failed to send message: {}", e);
-            };
-        };
+    async fn reboot(&mut self) {
+
+        println!("Rebooting transmitter as requested by server.");
+        // send a close frame to the server for closing the connection
+
+        _ = self.send_channel
+                .clone()
+                .expect("Failed to send close message, send channel is not set")
+                .send(Message::Close(Some(CloseFrame {
+                    code: frame::coding::CloseCode::Normal,
+                    reason: "Rebooting".into(),
+                }))).await;
+        self.reconnect_count = 0;
+        self.cancellation_token.cancel();
+    }
+
+    async fn handle_message(&mut self, message: serde_json::Value) {
         if let Some(command_type) = message["type"].as_str() {
             println!("Message received, type: \"{}\"", &command_type);
             match command_type {
                 "request_heartbeat" => {
                     println!("Sending message for requested heartbeat");    
                     let hearbeat: serde_json::Value = Self::get_sample_heartbeat(&self.time_started, self.reconnect_count);
-                    send_json(hearbeat).await;
+                    self.send_json(hearbeat).await;
                 }
                 "device_assignment" => {
                     if let Err(e) = self.update_devices(message["devices"].clone()){
-                        println!("Update devices failed, incorrect json, Error: {}", e)
+                        eprintln!("Update devices failed, incorrect json, Error: {}", e)
                     };
                 }
                 "wol" => {
@@ -99,14 +122,14 @@ impl TransmitterProtocolHandler {
 
                 }
                 "ota_update" => {
-                    send_json(json!({
+                    self.send_json(json!({
                         "type": "ota_result",
                         "success": false,
                         "message": "Docker Transmitters cannot be updated remotely!"
                     })).await
                 }
                 "wifi_config_get" => {
-                    send_json(json!({
+                    self.send_json(json!({
                         "type": "wifi.config",
                         "pico_id": self.pico_id,
                         "networks": [],
@@ -115,11 +138,14 @@ impl TransmitterProtocolHandler {
                     ).await
                 }
                 "wifi_config_set" => {
-                    send_json(json!({
+                    self.send_json(json!({
                         "type": "error",
                         "message": "Docker transmitters doesn't work on WiFi.",
                         })
                     ).await
+                }
+                "reboot" => {
+                    self.reboot().await;
                 }
                 "firmware_update_available" => {
                     //Do nothing and just log to std
@@ -129,7 +155,10 @@ impl TransmitterProtocolHandler {
                     println!("Authentication successful.");
                     self.pico_id = message["pico_id"].to_string();
                     self.assigned_devices = serde_json::from_value(message["assigned_devices"].clone()).unwrap_or(vec![]);
-                    self.heartbeat_handle = Some(self.start_heartbeats(&send_channel).await);
+                    self.start_heartbeats(
+                        self.send_channel.clone().expect("Heartbeats could not be started, Send Channel is not set"), 
+                        self.cancellation_token.clone()
+                    ).await;
                 }
 
                 "auth_fail" => {
@@ -170,19 +199,26 @@ impl TransmitterProtocolHandler {
         Ok(())
     }
 
-    async fn start_heartbeats(&self, send_channel: &mpsc::Sender<Message>) -> tokio::task::JoinHandle<()> {
-        let send_channel: mpsc::Sender<Message> = send_channel.clone();
+    async fn start_heartbeats(&self, send_channel: mpsc::Sender<Message>, cancellation_token: CancellationToken) -> tokio::task::JoinHandle<()> {
         let heartbeat_interval: u16 = self.heartbeat_interval;
         let start_time: std::time::Instant = self.time_started.clone();
         let reconnect_count: u32 = self.reconnect_count;
+        let token_clone = cancellation_token.clone();
         tokio::spawn(async move {
             println!("Heartbeat task started, sending every {} seconds.", &heartbeat_interval);
             loop {
-                // TODO: Need to handle SIGTERM cleanly here too.
-                tokio::time::sleep(tokio::time::Duration::from_secs(heartbeat_interval as u64)).await;
-                if let Err(e) = send_channel.send(Self::get_sample_heartbeat(&start_time, reconnect_count).to_string().into()).await {
-                    eprintln!("Failed to send heartbeat: {}", e);
-                    break;
+                tokio::select! {
+                    _ = token_clone.cancelled() => {
+                        // println!("Heartbeat task received cancellation signal, exiting.");
+                        break;
+                    }
+                    // TODO: Need to handle SIGTERM cleanly here too.
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(heartbeat_interval as u64)) => {
+                        if let Err(e) = send_channel.send(Self::get_sample_heartbeat(&start_time, reconnect_count).to_string().into()).await {
+                            eprintln!("Failed to send heartbeat: {}", e);
+                            break;
+                        }
+                    }
                 }
             }
         })
@@ -247,6 +283,9 @@ impl TransmitterProtocolHandler {
             tokio::signal::unix::SignalKind::terminate()
             ).unwrap();
         loop {
+            if self.cancellation_token.is_cancelled() {
+                self.cancellation_token = CancellationToken::new();
+            }
             // Retry until auth is succesful
             match self.open_websocket().await {
                 Ok(ws_stream) => {
@@ -255,59 +294,77 @@ impl TransmitterProtocolHandler {
                     // Create a multi producter and single-consumer asynchronous channel
                     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Message>(32);
                     let (incoming_tx, mut incoming_rx) = mpsc::channel::<serde_json::Value>(32);
+                    self.send_channel = Some(outgoing_tx.clone());
+
                     
-                    let outgoing_tx_clone = outgoing_tx.clone();
                     // Write task: drains the channel and forwards messages to the WebSocket
+                    let cancellation_token_clone = self.cancellation_token.clone();
                     let mut write_task = tokio::spawn(async move {
-                        while let Some(msg) = outgoing_rx.recv().await {
-                            if let Err(e) = write_half.send(msg).await {
-                                eprintln!("Write error: {}", e);
-                                break;
+                        loop {
+                            tokio::select! {
+                                _ = cancellation_token_clone.cancelled() => {
+                                    // println!("Write task received cancellation signal, exiting.");
+                                    break;
+                                }
+                                Some(msg) = outgoing_rx.recv() => {
+                                    if let Err(e) = write_half.send(msg).await {
+                                        eprintln!("Write error: {}", e);
+                                        break;
+                                    }
+                                }
                             }
                         }
                     });
-
+                    let cancellation_token_clone = self.cancellation_token.clone();
                     // Read task: handles incoming messages; routes pongs back through the channel
+                    let outgoing_tx_clone = self.send_channel.as_ref().unwrap().clone();
                     let mut read_task = tokio::spawn(async move {
-                        while let Some(result) = read_half.next().await {
-                            match result {
-                                Ok(Message::Text(text)) => {
-                                    match serde_json::from_str::<serde_json::Value>(text.as_str()) {
-                                        Ok(json_message) => {
-                                            if let Err(e) = incoming_tx.send(json_message).await {
-                                                eprintln!("Failed to receive incoming message: {}", e);
-                                                break;
+                        loop {
+                            tokio::select! {
+                                _ = cancellation_token_clone.cancelled() => {
+                                    // println!("Read task received cancellation signal, exiting.");
+                                    break;
+                                }
+                                Some(msg) = read_half.next() => {
+                                    match msg {
+                                        Ok(Message::Text(text)) => {
+                                            match serde_json::from_str::<serde_json::Value>(text.as_str()) {
+                                                Ok(json_message) => {
+                                                    if let Err(e) = incoming_tx.send(json_message).await {
+                                                        eprintln!("Failed to receive incoming message: {}", e);
+                                                        break;
+                                                    }
+                                                }
+
+                                                Err(e) => {
+                                                    eprintln!("Invalid JSON: {}", e);
+                                                }
                                             }
                                         }
 
-                                        Err(e) => {
-                                            eprintln!("Invalid JSON: {}", e);
+                                        Ok(Message::Ping(payload)) => {
+                                            outgoing_tx_clone
+                                                .send(Message::Pong(payload))
+                                                .await
+                                                .unwrap();
                                         }
+
+                                        Ok(Message::Close(_)) => {
+                                            println!("Websocket Connection Closed.");
+                                            break;
+                                        }
+
+                                        Err(e) => {
+                                            eprintln!("Read error {}", e);
+                                            // return Err(e);
+                                            break;
+                                        }
+
+                                        _ => {}
                                     }
                                 }
-
-                                Ok(Message::Ping(payload)) => {
-                                    outgoing_tx_clone
-                                        .send(Message::Pong(payload))
-                                        .await
-                                        .unwrap();
-                                }
-
-                                Ok(Message::Close(_)) => {
-                                    println!("Websocket Connection Closed.");
-                                    break;
-                                }
-
-                                Err(e) => {
-                                    eprintln!("Read error {}", e);
-                                    // return Err(e);
-                                    break;
-                                }
-
-                                _ => {}
-                            }
                         }
-                    });
+                    }});
                     // Send the authentication message to the server. If it fails, we wait for a backoff time and retry.
                     if let Err(e) = outgoing_tx.send(self.get_authentication_message()).await {
                         println!("{}", e);
@@ -328,49 +385,27 @@ impl TransmitterProtocolHandler {
                                     code: frame::coding::CloseCode::Normal,
                                     reason: "Shutting down.".into(),
                                 }))).await;
-                                write_task.abort();
-                                read_task.abort();
                                 stop_now = true;
                                 break;
                             }
                             Some(json_message) = incoming_rx.recv() => {
-                                match json_message["type"].as_str() {
-                                    // if the server sends a reboot command, we abort the read and write tasks and break out of the loop to reconnect.
-                                    Some("reboot") => {
-                                        println!("Rebooting transmitter as requested by server.");
-                                        // send a close frame to the server for closing the connection
-                                        _ = outgoing_tx.send(Message::Close(Some(CloseFrame {
-                                            code: frame::coding::CloseCode::Normal,
-                                            reason: "Rebooting".into(),
-                                        }))).await;
-                                        read_task.abort();
-                                        write_task.abort();
-                                        self.reconnect_count = 0;
-                                        break;
-                                    }
-                                    _ => {
-                                        self.handle_message(json_message, &outgoing_tx).await;
-                                    }
-                                }
+                                self.handle_message(json_message).await;
                             },
                             // break exists so that when either of them returns(something happened such that they returned) 
                             // we can reconnect to the websocket.
                             _ = &mut read_task => {
                                 // If the read task ends, we abort the write task and break to reconnect
-                                write_task.abort();
                                 break;
                             },
                             _ = &mut write_task => {
                                 // If the write task ends, we abort the read task and break to reconnect
-                                read_task.abort();
                                 break;
                             }
                         }
                     }
                     // If we reach here, it means either the read or write task has ended, so we abort the heartbeat task if it exists.
-                    if let Some(handle) = &self.heartbeat_handle.take(){
-                        handle.abort();
-                    }
+                    self.cancellation_token.cancel();
+                    // There is a off by one bug here when transmitter is rebooting
                     self.reconnect_count += 1;
                 }
                 Err(e) => {
