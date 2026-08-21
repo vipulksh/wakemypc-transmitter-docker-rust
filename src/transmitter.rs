@@ -212,7 +212,6 @@ impl TransmitterProtocolHandler {
                         // println!("Heartbeat task received cancellation signal, exiting.");
                         break;
                     }
-                    // TODO: Need to handle SIGTERM cleanly here too.
                     _ = tokio::time::sleep(tokio::time::Duration::from_secs(heartbeat_interval as u64)) => {
                         if let Err(e) = send_channel.send(Self::get_sample_heartbeat(&start_time, reconnect_count).to_string().into()).await {
                             eprintln!("Failed to send heartbeat: {}", e);
