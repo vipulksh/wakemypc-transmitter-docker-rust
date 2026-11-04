@@ -1,9 +1,11 @@
 static FIRMWARE_VERSION: &str = "0.1.0-docker";
 static MAX_RETRY_LIMIT_SECS: u64 = 60;
+use std::str::FromStr;
 use std::time::{
     Instant,
 };
 use serde_json::json;
+use tokio::sync::broadcast;
 use tokio::{
     sync::mpsc,
     net::TcpStream,
@@ -25,6 +27,7 @@ use futures_util::{
     SinkExt
 };
 use sysinfo::{System};
+use std::net::UdpSocket;
 
 #[derive(serde::Deserialize, std::clone::Clone)]
 struct Device {
@@ -110,7 +113,36 @@ impl TransmitterProtocolHandler {
                     };
                 }
                 "wol" => {
-                    let _ = self.handle_wol(message["mac"].to_string()).await;
+                    let mut broadcast_addr: String = String::from_str("255.255.255.255:9").unwrap();
+                    println!("WOL message received: {}", message);
+                    let mac_address = message["mac"].to_string()
+                                            .trim()
+                                            .trim_matches('"')
+                                            .to_string();
+                    if message["broadcast_addr"].is_string() {
+                        broadcast_addr = message["broadcast_addr"].to_string()
+                                            .trim()
+                                            .trim_matches('"')
+                                            .to_string();
+                    }
+                    match self.handle_wol(&mac_address, &broadcast_addr).await {
+                        Ok(()) => {
+                            println!("WOL packet sent successfully to mac address: {}", mac_address);
+                            // self.send_json(json!({
+                            //     "type": "wol_result",
+                            //     "success": true,
+                            //     "message": format!("WOL packet sent successfully to mac address: {}", mac_address)
+                            // })).await
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to send WOL packet to mac address: {} with error: {}", mac_address, e);
+                            // self.send_json(json!({
+                            //     "type": "wol_result",
+                            //     "success": false,
+                            //     "message": format!("Failed to send WOL packet to mac address: {}", mac_address)
+                            // })).await
+                        }
+                    }
                 }
                 "tcp_relay_open" => {
 
@@ -182,14 +214,23 @@ impl TransmitterProtocolHandler {
         }
     }       
 
-    async fn handle_wol(&self, to_wake_mac: String) -> Result<(), String> {
+    async fn handle_wol(&self, mac_address: &str, broadcast_addr: &str) -> std::io::Result<()> {
         // let request_id: String = message["request_id"].to_string();
-
-        if !self.assigned_devices.iter().any(|device: &Device| device.mac == to_wake_mac) {
-            Err(String::from("Mac Address not assigned. Prevented Wake-on-lan Packet from being sent"))
+        if !self.assigned_devices.iter().any(|device: &Device| &device.mac == mac_address) {
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Mac Address not assigned. Prevented Wake-on-lan Packet from being sent"))
         }
         else {
-            println!("Wake on lan packet sent");
+            let mut payload: Vec<u8> = Vec::new();
+            let mac_bytes: Vec<u8> = mac_address.split(':')
+                .map(|s| u8::from_str_radix(s, 16).unwrap())
+                .collect();
+            payload.extend_from_slice(&[0xFF; 6]);
+            for _ in 0..16 {
+                payload.extend_from_slice(&mac_bytes);
+            }
+            let socket = UdpSocket::bind("0.0.0.0:0")?;
+            socket.set_broadcast(true)?;
+            socket.send_to(&payload, broadcast_addr)?;
             Ok(())
         }
     }
@@ -224,7 +265,7 @@ impl TransmitterProtocolHandler {
     }
 
     fn get_sample_heartbeat(started_at: &Instant, reconnect_count: u32) -> serde_json::Value {
-        let sys: System = System::new_all();
+        let sys: System = System::new_all().expect("Error getting system info");
         let now: Instant = Instant::now();
         json!({
             "type": "heartbeat",
