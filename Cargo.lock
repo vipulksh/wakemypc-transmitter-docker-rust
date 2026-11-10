@@ -517,6 +517,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "ping-tokio"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bb2efac84cc129323ea3c85c6d992e9afa15bc160471e204586f4ea137abc96"
+dependencies = [
+ "libc",
+ "socket2",
+ "tokio",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -897,6 +908,7 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "local-ip-address",
+ "ping-tokio",
  "rustls",
  "serde",
  "serde_json",
