@@ -4,8 +4,7 @@ use std::str::FromStr;
 use std::time::{
     Instant,
 };
-use serde_json::json;
-use tokio::sync::broadcast;
+use serde_json::{json};
 use tokio::{
     sync::mpsc,
     net::TcpStream,
@@ -28,6 +27,7 @@ use futures_util::{
 };
 use sysinfo::{System};
 use std::net::UdpSocket;
+use ping_tokio::ping;
 
 #[derive(serde::Deserialize, std::clone::Clone)]
 struct Device {
@@ -99,6 +99,8 @@ impl TransmitterProtocolHandler {
     }
 
     async fn handle_message(&mut self, message: serde_json::Value) {
+
+        let (new_device_assignment_sender, new_device_assignment_receiver) = mpsc::channel::<serde_json::Value>(1024);
         if let Some(command_type) = message["type"].as_str() {
             println!("Message received, type: \"{}\"", &command_type);
             match command_type {
@@ -111,19 +113,16 @@ impl TransmitterProtocolHandler {
                     if let Err(e) = self.update_devices(message["devices"].clone()){
                         eprintln!("Update devices failed, incorrect json, Error: {}", e)
                     };
+                    new_device_assignment_sender.send(message["devices"].clone()).await.unwrap_or_else(|e| eprintln!("Failed to send device assignment message, Error: {}", e));
+                    println!("Message {} received, type: \"{}\"", &message, &command_type);
+                    // println!("Device assignments updated.{}", if self.assigned_devices.is_empty() { " No devices assigned." } else { "" });
                 }
                 "wol" => {
                     let mut broadcast_addr: String = String::from_str("255.255.255.255:9").unwrap();
                     println!("WOL message received: {}", message);
-                    let mac_address = message["mac"].to_string()
-                                            .trim()
-                                            .trim_matches('"')
-                                            .to_string();
+                    let mac_address: String = serde_json::from_value(message["mac"].clone()).unwrap_or_default();
                     if message["broadcast_addr"].is_string() {
-                        broadcast_addr = message["broadcast_addr"].to_string()
-                                            .trim()
-                                            .trim_matches('"')
-                                            .to_string();
+                        broadcast_addr = serde_json::from_value(message["broadcast_addr"].clone()).unwrap_or_default();
                     }
                     match self.handle_wol(&mac_address, &broadcast_addr).await {
                         Ok(()) => {
@@ -185,10 +184,15 @@ impl TransmitterProtocolHandler {
                 }
                 "auth_ok" => {
                     println!("Authentication successful.");
-                    self.pico_id = message["pico_id"].to_string();
+                    self.pico_id = serde_json::from_value(message["pico_id"].clone()).unwrap_or_default();
                     self.assigned_devices = serde_json::from_value(message["assigned_devices"].clone()).unwrap_or(vec![]);
                     self.start_heartbeats(
                         self.send_channel.clone().expect("Heartbeats could not be started, Send Channel is not set"), 
+                        self.cancellation_token.clone()
+                    ).await;
+                    self.start_device_pings(
+                        self.send_channel.clone().expect("Device pings could not be started, Send Channel is not set"), 
+                        new_device_assignment_receiver,
                         self.cancellation_token.clone()
                     ).await;
                 }
@@ -213,6 +217,76 @@ impl TransmitterProtocolHandler {
             println!("Missing message type");
         }
     }       
+    async fn start_device_pings(&self, send_channel: mpsc::Sender<Message>, mut new_device_assignment: mpsc::Receiver<serde_json::Value>, cancellation_token: CancellationToken) -> tokio::task::JoinHandle<()> {
+        let ping_interval: u16 = 5;
+        let token_clone = cancellation_token.clone();
+        let devices_clone: Vec<Device> = self.assigned_devices.clone();
+        tokio::spawn(async move {
+            println!("Device ping task started, sending every {} seconds.", &ping_interval);
+            let mut devices = devices_clone;
+            loop {
+                tokio::select! {
+                    _ = token_clone.cancelled() => {
+                        // println!("Device ping task received cancellation signal, exiting.");
+                        break;
+                    }
+                    Some(new_devices) = new_device_assignment.recv() => {
+                        // Handle device assignment updates here
+                            println!("new device assignment received: {}", new_devices.clone());
+                        if let Ok(updated_devices) = serde_json::from_value::<Vec<Device>>(new_devices) {
+                            devices = updated_devices;
+                            println!("Device assignments updated.{}", if devices.is_empty() { " No devices assigned." } else { "" });
+                            for device in &devices {
+                                println!("Device: {} with IP: {} and MAC: {} assigned.", device.name, device.ip, device.mac);
+                            }
+                            } else {
+                                eprintln!("Failed to parse device assignments from message.");
+                            }
+                    }
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(ping_interval as u64)) => {
+                        for device in &devices {
+                            println!("Pinging device: {} with IP: {}", device.name, device.ip);
+                        }
+                        for device in &devices {
+                            let stat = ping("0.0.0.0", device.ip.clone(), 4, std::time::Duration::from_secs(1), 64).await;
+                            match stat {
+                                Ok(stat) => {
+                                    if stat.packets_rx > 0 {
+                                        println!("Device {} is online.", device.name);
+                                        send_channel.send(json!({
+                                            "type": "device_status",
+                                            "devices": serde_json::Value::Array(vec![json!({
+                                                "public_id": device.public_id,
+                                                "online": true,
+                                                "ip": device.ip,
+                                            })])
+                                        }).to_string().into()).await.expect("Failed to send device status message");
+                                    } else {
+                                        println!("Device {} is offline.", device.name);
+                                        send_channel.send(json!({
+                                            "type": "device_status",
+                                            "devices": serde_json::Value::Array(vec![json!({
+                                                "public_id": device.public_id,
+                                                "online": false,
+                                                "ip": device.ip,
+                                            })])
+                                        }).to_string().into()).await.expect("Failed to send device status message");
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Error occurred while pinging device {}: {}", device.name, e);
+                                }
+                            }
+                        }
+
+                    }
+                    // _ = receive_device_assignments() => {
+                    //     // Handle device assignment updates here
+                    // }
+                }
+            }
+        })
+    }
 
     async fn handle_wol(&self, mac_address: &str, broadcast_addr: &str) -> std::io::Result<()> {
         // let request_id: String = message["request_id"].to_string();
